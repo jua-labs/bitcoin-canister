@@ -8,6 +8,9 @@ import Nat "mo:base/Nat";
 import Result "mo:base/Result";
 import Array "mo:base/Array";
 import Iter "mo:base/Iter";
+import Float "mo:base/Float";
+import Nat64 "mo:base/Nat64";
+import Int "mo:base/Int";
 
 import BitcoinApi "bitcoinapi";
 import BitcoinWallet "bitcoinwallet";
@@ -63,7 +66,7 @@ actor class EscrowBitcoin(_network : Types.Network) {
   type EscrowData = {
     seller : Principal;
     buyer : Principal;
-    amount : Satoshi;
+    amount : Float;
     status : EscrowStatus;
     sellerAddress : BitcoinAddress;
     buyerAddress : BitcoinAddress;
@@ -75,7 +78,7 @@ actor class EscrowBitcoin(_network : Types.Network) {
     id : Text;
     seller : Principal;
     buyer : Principal;
-    amount : Satoshi;
+    amount : Float;
     status : EscrowStatus;
   };
 
@@ -91,8 +94,27 @@ actor class EscrowBitcoin(_network : Types.Network) {
     };
   };
 
+  // Utility function to convert Bitcoin to Satoshis
+  private func bitcoinToSatoshis(btc : Float) : Satoshi {
+    let satoshisFloat : Float = btc * 1e8;
+    let satoshisInt : Int = Float.toInt(satoshisFloat);
+    
+    if (satoshisInt < 0) {
+      Debug.print("Warning: Negative Bitcoin amount converted to 0 Satoshis");
+      return 0;
+    };
+    
+    let satoshisNat : Nat = Int.abs(satoshisInt);
+    Nat64.fromNat(satoshisNat)
+  };
+
+  // Utility function to convert Satoshis to Bitcoin
+  private func satoshisToBitcoin(satoshis : Satoshi) : Float {
+    Float.fromInt(Nat64.toNat(satoshis)) / 1e8
+  };
+
   // Create a new escrow after checking seller's balance
-  public shared (msg) func createEscrow(seller : Principal, buyer : Principal, amount : Satoshi, sellerAddress : BitcoinAddress, buyerAddress : BitcoinAddress, sellerPrivateKey : Text) : async Result.Result<Text, Text> {
+  public shared (msg) func createEscrow(seller : Principal, buyer : Principal, amount : Float, sellerAddress : BitcoinAddress, buyerAddress : BitcoinAddress, sellerPrivateKey : Text) : async Result.Result<Text, Text> {
     Debug.print("Attempting to create escrow...");
 
     let isConnected = await checkBitcoinConnection();
@@ -100,19 +122,12 @@ actor class EscrowBitcoin(_network : Types.Network) {
       Debug.print("Cannot create escrow: Not connected to Bitcoin network");
       return #err("Not connected to Bitcoin network");
     };
-    
+
     // Check seller's balance
     let sellerBalance = await get_balance(NETWORK, sellerAddress);
-    if (sellerBalance < amount) {
-      Debug.print("Insufficient funds in seller's address");
-      return #err("Insufficient funds in seller's address");
-    };
-
-    // Check if seller's balance is already allocated to existing escrows
-    let allocatedBalance = getAllocatedBalance(seller);
-    if (sellerBalance - allocatedBalance < amount) {
-      Debug.print("Seller's available balance is insufficient due to existing escrows");
-      return #err("Insufficient available balance due to existing escrows");
+    if (sellerBalance.available < amount) {
+      Debug.print("Insufficient available funds in seller's address");
+      return #err("Insufficient available funds in seller's address");
     };
 
     let escrowId = Utils.generateUniqueId();
@@ -134,17 +149,6 @@ actor class EscrowBitcoin(_network : Types.Network) {
     #ok(escrowId);
   };
 
-  // Helper function to get total allocated balance for a seller
-  private func getAllocatedBalance(seller : Principal) : Satoshi {
-    var total : Satoshi = 0;
-    for ((_, escrow) in escrows.entries()) {
-      if (escrow.seller == seller and escrow.status != #completed and escrow.status != #cancelled) {
-        total += escrow.amount;
-      };
-    };
-    total;
-  };
-
   // Initiate payment and mark escrow as pending payment
   public shared (msg) func initiatePayment(escrowId : Text) : async Result.Result<Text, Text> {
     switch (escrows.get(escrowId)) {
@@ -156,8 +160,9 @@ actor class EscrowBitcoin(_network : Types.Network) {
           case (#created) {
             // Initiate the Bitcoin transaction
             try {
-              let txId = await sendFromSellerToBuyer(escrow.sellerAddress, escrow.buyerAddress, escrow.amount, escrow.sellerPrivateKey);
-              
+              let amountInSatoshis : Satoshi = bitcoinToSatoshis(escrow.amount);
+              let txId = await sendFromSellerToBuyer(escrow.sellerAddress, escrow.buyerAddress, amountInSatoshis, escrow.sellerPrivateKey);
+
               if (txId != "") {
                 // Update escrow status and store the transaction ID
                 escrows.put(
@@ -213,7 +218,8 @@ actor class EscrowBitcoin(_network : Types.Network) {
             switch (escrow.transactionId) {
               case (?txId) {
                 let confirmations = await getTransactionConfirmations(txId);
-                if (confirmations >= 1) {  // You can adjust this threshold as needed
+                if (confirmations >= 1) {
+                  // You can adjust this threshold as needed
                   // Update escrow status to paid
                   let updatedEscrow = {
                     seller = escrow.seller;
@@ -255,7 +261,7 @@ actor class EscrowBitcoin(_network : Types.Network) {
     // This is a placeholder. You would need to implement this function
     // to check the number of confirmations for a Bitcoin transaction.
     // This might involve calling a Bitcoin node or using a third-party API.
-    5  // Placeholder return value
+    5 // Placeholder return value
   };
 
   // Private function to send from seller to buyer
@@ -335,17 +341,17 @@ actor class EscrowBitcoin(_network : Types.Network) {
     let escrowEntries = escrows.entries();
     let escrowSummaries = Array.map<(Text, EscrowData), EscrowSummary>(
       Iter.toArray(escrowEntries),
-      func ((id, escrow) : (Text, EscrowData)) : EscrowSummary {
+      func((id, escrow) : (Text, EscrowData)) : EscrowSummary {
         {
           id = id;
           seller = escrow.seller;
           buyer = escrow.buyer;
           amount = escrow.amount;
           status = escrow.status;
-        }
-      }
+        };
+      },
     );
-    escrowSummaries
+    escrowSummaries;
   };
 
   // Get escrows by user (either as seller or buyer)
@@ -353,17 +359,20 @@ actor class EscrowBitcoin(_network : Types.Network) {
     let allEscrows = await getAllEscrows();
     Array.filter<EscrowSummary>(
       allEscrows,
-      func (escrow : EscrowSummary) : Bool {
-        escrow.seller == user or escrow.buyer == user
-      }
-    )
+      func(escrow : EscrowSummary) : Bool {
+        escrow.seller == user or escrow.buyer == user;
+      },
+    );
   };
 
-  // Helper functions for Bitcoin operations
-  public func get_balance(network : Network, address : BitcoinAddress) : async Satoshi {
+  public func get_balance(network : Network, address : BitcoinAddress) : async {
+    total : Float;
+    available : Float;
+  } {
     let isConnected = await checkBitcoinConnection();
     if (not isConnected) {
       Debug.print("Cannot get balance: Not connected to Bitcoin network");
+      throw Error.reject("Not connected to Bitcoin network");
     };
 
     ExperimentalCycles.add(GET_BALANCE_COST_CYCLES);
@@ -371,16 +380,40 @@ actor class EscrowBitcoin(_network : Types.Network) {
     let management_canister_actor = getManagementCanisterActor();
 
     try {
-      let result = await management_canister_actor.bitcoin_get_balance({
+      let resultInSatoshis = await management_canister_actor.bitcoin_get_balance({
         address;
         network;
         min_confirmations = null;
       });
-      result;
+
+      // Convert Satoshis to Bitcoin
+      let totalBalanceInBitcoin : Float = satoshisToBitcoin(resultInSatoshis);
+
+      // Calculate the amount in escrow for this address
+      let amountInEscrow = getAmountInEscrow(address);
+
+      // Calculate available balance
+      let availableBalanceInBitcoin : Float = totalBalanceInBitcoin - amountInEscrow;
+
+      {
+        total = totalBalanceInBitcoin;
+        available = Float.max(0, availableBalanceInBitcoin);
+      };
     } catch (error) {
       Debug.print("BitcoinApi: Error calling management canister: " # Error.message(error));
       throw error;
     };
+  };
+
+  // Helper function to calculate the amount in escrow for a given address
+  private func getAmountInEscrow(address : BitcoinAddress) : Float {
+    var totalInEscrow : Float = 0;
+    for ((_, escrow) in escrows.entries()) {
+      if (escrow.sellerAddress == address and (escrow.status == #created or escrow.status == #pendingPayment)) {
+        totalInEscrow += escrow.amount;
+      };
+    };
+    totalInEscrow;
   };
 
   private func getManagementCanisterActor() : ManagementCanisterActor {
@@ -404,5 +437,153 @@ actor class EscrowBitcoin(_network : Types.Network) {
 
   public func get_p2pkh_address() : async BitcoinAddress {
     await BitcoinWallet.get_p2pkh_address(NETWORK, KEY_NAME, DERIVATION_PATH);
+  };
+
+  // Get the current Bitcoin price (placeholder function)
+  public func getBitcoinPrice() : async Float {
+    // This is a placeholder. In a real implementation, you would fetch the current Bitcoin price from an external API.
+    // For demonstration purposes, we're returning a fixed value.
+    35000.00 // Example price in USD
+  };
+
+  // Calculate the USD value of an escrow
+  public func getEscrowUsdValue(escrowId : Text) : async Result.Result<Float, Text> {
+    switch (escrows.get(escrowId)) {
+      case (null) {
+        #err("Escrow not found")
+      };
+      case (?escrow) {
+        let bitcoinPrice = await getBitcoinPrice();
+        let usdValue = escrow.amount * bitcoinPrice;
+        #ok(usdValue)
+      };
+    };
+  };
+
+  // Get total value of all escrows for a user
+  public func getTotalEscrowValue(user : Principal) : async Float {
+    let userEscrows = await getEscrowsByUser(user);
+    var totalValue : Float = 0;
+    for (escrow in userEscrows.vals()) {
+      totalValue += escrow.amount;
+    };
+    totalValue
+  };
+
+  // Get escrow statistics
+  public func getEscrowStatistics() : async {
+    totalEscrows : Nat;
+    totalValueLocked : Float;
+    completedEscrows : Nat;
+    cancelledEscrows : Nat;
+  } {
+    var totalEscrows = 0;
+    var totalValueLocked : Float = 0;
+    var completedEscrows = 0;
+    var cancelledEscrows = 0;
+
+    for ((_, escrow) in escrows.entries()) {
+      totalEscrows += 1;
+      switch (escrow.status) {
+        case (#created or #pendingPayment or #paid) {
+          totalValueLocked += escrow.amount;
+        };
+        case (#completed) {
+          completedEscrows += 1;
+        };
+        case (#cancelled) {
+          cancelledEscrows += 1;
+        };
+      };
+    };
+
+    {
+      totalEscrows = totalEscrows;
+      totalValueLocked = totalValueLocked;
+      completedEscrows = completedEscrows;
+      cancelledEscrows = cancelledEscrows;
+    }
+  };
+
+  // Update escrow amount (only allowed if status is #created)
+  public shared (msg) func updateEscrowAmount(escrowId : Text, newAmount : Float) : async Result.Result<(), Text> {
+    switch (escrows.get(escrowId)) {
+      case (null) {
+        #err("Escrow not found")
+      };
+      case (?escrow) {
+        if (escrow.status != #created) {
+          #err("Cannot update amount: escrow payment already initiated")
+        } else {
+          let updatedEscrow = {
+            seller = escrow.seller;
+            buyer = escrow.buyer;
+            amount = newAmount;
+            status = escrow.status;
+            sellerAddress = escrow.sellerAddress;
+            buyerAddress = escrow.buyerAddress;
+            transactionId = escrow.transactionId;
+            sellerPrivateKey = escrow.sellerPrivateKey;
+          };
+          escrows.put(escrowId, updatedEscrow);
+          #ok()
+        };
+      };
+    };
+  };
+
+  // Get transaction details (placeholder function)
+  public func getTransactionDetails(txId : Text) : async Result.Result<{confirmations : Nat; amount : Float}, Text> {
+    // This is a placeholder. In a real implementation, you would fetch the transaction details from the Bitcoin network.
+    // For demonstration purposes, we're returning mock data.
+    #ok({
+      confirmations = 3;
+      amount = 0.5; // BTC
+    })
+  };
+
+  // Calculate estimated transaction fee
+  public func estimateTransactionFee(amount : Float) : async Result.Result<Float, Text> {
+    try {
+      let feePercentiles = await get_current_fee_percentiles();
+      if (feePercentiles.size() == 0) {
+        return #err("Unable to fetch fee estimates");
+      };
+      
+      // Use the median fee (adjust as needed)
+      let medianFeeRate = feePercentiles[feePercentiles.size() / 2];
+      
+      // Estimate transaction size (this is a simplified estimate)
+      let estimatedTxSize : Float = 250; // bytes
+      
+      let estimatedFeeInSatoshis : Float = Float.fromInt(Nat64.toNat(medianFeeRate)) * estimatedTxSize / 1000;
+      let estimatedFeeInBtc : Float = estimatedFeeInSatoshis / 1e8;
+      
+      #ok(estimatedFeeInBtc)
+    } catch (error) {
+      #err("Error estimating fee: " # Error.message(error))
+    }
+  };
+
+  // Get all completed escrows within a date range
+  public func getCompletedEscrowsInDateRange(startDate : Int, endDate : Int) : async [EscrowSummary] {
+    // Note: This function assumes that you have added a timestamp field to your EscrowData type
+    // and that you're updating it when the escrow is completed.
+    // You'll need to modify the EscrowData type and relevant functions to include this.
+
+    let allEscrows = await getAllEscrows();
+    Array.filter<EscrowSummary>(
+      allEscrows,
+      func(escrow : EscrowSummary) : Bool {
+        switch (escrow.status) {
+          case (#completed) {
+            // Assuming you've added a completionTimestamp field to EscrowSummary
+            // escrow.completionTimestamp >= startDate and escrow.completionTimestamp <= endDate
+            true // Replace this with the actual condition when you've added the timestamp
+          };
+          case (_) false;
+        };
+      },
+    );
   };
 };
