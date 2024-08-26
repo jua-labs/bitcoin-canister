@@ -128,33 +128,24 @@ actor class EscrowBitcoin(initialAdminPrincipal : Principal) {
     };
   };
 
-  // Utility function to convert Bitcoin to Satoshis
-  private func bitcoinToSatoshis(btc : Float) : Satoshi {
+  // Helper function to convert Bitcoin (Float) to Satoshi (Nat64)
+  private func bitcoinToSatoshi(btc : Float) : Satoshi {
     let satoshisFloat : Float = btc * 1e8;
     let satoshisInt : Int = Float.toInt(satoshisFloat);
-
-    if (satoshisInt < 0) {
-      Debug.print("Warning: Negative Bitcoin amount converted to 0 Satoshis");
-      return 0;
-    };
-
-    let satoshisNat : Nat = Int.abs(satoshisInt);
-    Nat64.fromNat(satoshisNat);
+    Nat64.fromNat(Int.abs(satoshisInt));
   };
 
-  // Utility function to convert Satoshis to Bitcoin
-  private func satoshisToBitcoin(satoshis : Satoshi) : Float {
+  // Helper function to convert Satoshi (Nat64) to Bitcoin (Float)
+  private func satoshiToBitcoin(satoshis : Satoshi) : Float {
     Float.fromInt(Nat64.toNat(satoshis)) / 1e8;
   };
 
-  public func get_balance(address : BitcoinAddress) : async {
-    total : Float;
-    available : Float;
-  } {
+  // Modified get_balance function to return a Result type
+  public func get_balance(address : BitcoinAddress) : async Result.Result<{ total : Float; available : Float }, Text> {
     let isConnected = await checkBitcoinConnection();
     if (not isConnected) {
       Debug.print("Cannot get balance: Not connected to Bitcoin network");
-      throw Error.reject("Not connected to Bitcoin network");
+      return #err("Not connected to Bitcoin network");
     };
 
     ExperimentalCycles.add(GET_BALANCE_COST_CYCLES);
@@ -169,33 +160,33 @@ actor class EscrowBitcoin(initialAdminPrincipal : Principal) {
       });
 
       // Convert Satoshis to Bitcoin
-      let totalBalanceInBitcoin : Float = satoshisToBitcoin(resultInSatoshis);
+      let totalBalanceInBitcoin : Float = satoshiToBitcoin(resultInSatoshis);
 
       // Calculate the amount in escrow for this address
       let amountInEscrow = getAmountInEscrow(address);
 
       // Calculate available balance
-      let availableBalanceInBitcoin : Float = totalBalanceInBitcoin - amountInEscrow;
+      let availableBalanceInBitcoin : Float = Float.max(0, totalBalanceInBitcoin - amountInEscrow);
 
-      {
+      #ok({
         total = totalBalanceInBitcoin;
-        available = Float.max(0, availableBalanceInBitcoin);
-      };
+        available = availableBalanceInBitcoin;
+      });
     } catch (error) {
       Debug.print("BitcoinApi: Error calling management canister: " # Error.message(error));
-      throw error;
+      #err(Error.message(error));
     };
   };
 
   // Helper function to calculate the amount in escrow for a given address
   private func getAmountInEscrow(address : BitcoinAddress) : Float {
-    var totalInEscrow : Float = 0;
-    for ((_, escrow) in escrows.entries()) {
-      if (escrow.sellerAddress == address and escrow.network == NETWORK and (escrow.status == #created or escrow.status == #fundsPending)) {
-        totalInEscrow += satoshisToBitcoin(escrow.amount);
+    var totalInEscrow : Satoshi = 0;
+    for (escrow in escrows.vals()) {
+      if (escrow.sellerAddress == address and (escrow.status == #created or escrow.status == #fundsPending)) {
+        totalInEscrow += escrow.amount;
       };
     };
-    totalInEscrow;
+    satoshiToBitcoin(totalInEscrow);
   };
 
   private func getManagementCanisterActor() : ManagementCanisterActor {
@@ -230,30 +221,56 @@ actor class EscrowBitcoin(initialAdminPrincipal : Principal) {
     escrowAddress : BitcoinAddress,
     description : Text,
   ) : async Result.Result<Text, Text> {
-    let escrowId = generateUniqueId();
-    let currentTime = Time.now();
+    // First, get the total balance for the seller
+    let balanceResult = await get_balance(sellerAddress);
 
-    let newEscrow : EscrowData = {
-      id = escrowId;
-      seller = msg.caller;
-      buyer = buyer;
-      amount = amount;
-      status = #created;
-      sellerAddress = sellerAddress;
-      buyerAddress = buyerAddress;
-      escrowAddress = escrowAddress;
-      transactionId = null;
-      creationTime = currentTime;
-      lastUpdateTime = currentTime;
-      completionTime = null;
-      cancellationTime = null;
-      refundTime = null;
-      description = description;
-      network = NETWORK;
+    switch (balanceResult) {
+      case (#ok(balance)) {
+        let totalBalance : Satoshi = bitcoinToSatoshi(balance.total);
+
+        // Calculate the total amount in uncompleted escrows for this seller
+        var uncompletedEscrowsTotal : Satoshi = 0;
+        for (escrow in escrows.vals()) {
+          if (escrow.sellerAddress == sellerAddress and escrow.status != #completed and escrow.status != #cancelled and escrow.status != #refunded) {
+            uncompletedEscrowsTotal += escrow.amount;
+          };
+        };
+
+        // Check if there's enough available balance
+        if (totalBalance < (uncompletedEscrowsTotal + amount)) {
+          return #err("Insufficient available balance. Total: " # Nat64.toText(totalBalance) # ", Uncompleted escrows: " # Nat64.toText(uncompletedEscrowsTotal) # ", Requested: " # Nat64.toText(amount));
+        };
+
+        // If we have sufficient balance, proceed with escrow creation
+        let escrowId = generateUniqueId();
+        let currentTime = Time.now();
+
+        let newEscrow : EscrowData = {
+          id = escrowId;
+          seller = msg.caller;
+          buyer = buyer;
+          amount = amount;
+          status = #created;
+          sellerAddress = sellerAddress;
+          buyerAddress = buyerAddress;
+          escrowAddress = escrowAddress;
+          transactionId = null;
+          creationTime = currentTime;
+          lastUpdateTime = currentTime;
+          completionTime = null;
+          cancellationTime = null;
+          refundTime = null;
+          description = description;
+          network = NETWORK;
+        };
+
+        escrows.put(escrowId, newEscrow);
+        #ok(escrowId);
+      };
+      case (#err(errorMsg)) {
+        #err("Failed to get balance: " # errorMsg);
+      };
     };
-
-    escrows.put(escrowId, newEscrow);
-    #ok(escrowId);
   };
 
   // Update escrow status when funds are sent (called by backend)
